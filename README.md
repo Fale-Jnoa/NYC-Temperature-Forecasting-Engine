@@ -42,7 +42,7 @@ NYC-Temp-Forecaster/
 │   ├── knyc_model_daily_high.pkl
 │   ├── knyc_model_t3h.pkl
 │   └── knyc_model_t6h.pkl
-└── .env                        # Discord credentials (never committed)
+└── .env                        # Discord credentials 
 ```
 
 ---
