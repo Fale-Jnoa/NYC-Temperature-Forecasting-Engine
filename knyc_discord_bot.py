@@ -1,35 +1,3 @@
-"""
-KNYC Live Nowcaster — Discord Bot
-==================================
-Posts hourly KNYC temperature predictions to a channel named "Predictions".
-
-Setup
------
-1. Install dependencies:
-       pip install "discord.py>=2.0" python-dotenv requests pandas numpy scikit-learn joblib
-
-2. Create a .env file in the same folder as this script:
-       DISCORD_TOKEN=your_bot_token_here
-       GUILD_ID=your_server_id_here
-
-3. Train models by running KNYC_Nowcaster.ipynb (cells 0–10), which saves:
-       knyc_model_daily_high.pkl
-       knyc_model_t3h.pkl
-       knyc_model_t6h.pkl
-
-4. Run:
-       python knyc_discord_bot.py
-
-Behavior
---------
-- Posts one nowcast immediately on startup (so you can verify it works).
-- Then waits until :54 UTC of the current hour and posts every 60 min after that
-  (3 min after KNYC METAR drops at :51).
-- Each post includes: current temp, dewpoint, RH, t+3h, t+6h, model high,
-  observed high so far today, and the reassessed high (floor-locked once obs
-  exceed the model call).
-"""
-
 import os
 import re
 import asyncio
@@ -46,7 +14,7 @@ from dotenv import load_dotenv
 import discord
 from discord.ext import tasks
 
-# ── Credentials ────────────────────────────────────────────────────────────
+# ── Credentials 
 load_dotenv()
 DISCORD_TOKEN = os.getenv('DISCORD_TOKEN')
 GUILD_ID = int(os.getenv("GUILD_ID") or 0)
@@ -57,7 +25,7 @@ if not DISCORD_TOKEN:
 if not GUILD_ID:
     raise RuntimeError('GUILD_ID not set. Add it to your .env file.')
 
-# ── Model paths ─────────────────────────────────────────────────────────────
+# ── Model paths 
 _HERE = os.path.dirname(os.path.abspath(__file__))
 
 print('Loading models...')
@@ -66,7 +34,7 @@ model_t3h  = joblib.load(os.path.join(_HERE, 'knyc_model_t3h.pkl'))
 model_t6h  = joblib.load(os.path.join(_HERE, 'knyc_model_t6h.pkl'))
 print('✅ Models loaded')
 
-# ── Feature column list (must match KNYC_Nowcaster.ipynb exactly) ──────────
+# ── Feature column list 
 FEATURE_COLS = [
     'tmpf', 'dwpf', 'relh', 'mslp', 'sknt', 'feel_gap',
     'dew_depression', 'td_ratio',
@@ -82,7 +50,7 @@ FEATURE_COLS = [
     'hour', 'month', 'dayofyear',
 ]
 
-# ── IEM website scraper (faster than API) ──────────────────────────────────
+# ── IEM website scraper 
 def _scrape_latest_ob():
     """Scrape the latest :51 KNYC obs from IEM obhistory page."""
     today_est = datetime.now(EST).strftime('%Y-%m-%d')
@@ -98,22 +66,20 @@ def _scrape_latest_ob():
     except Exception:
         return None
 
-    # Observation table is the largest table on the page
     obs = max(tables, key=len)
     if isinstance(obs.columns, pd.MultiIndex):
         obs.columns = [' '.join(str(c) for c in col).strip() for col in obs.columns]
 
-    # Sorted desc — first :51 match is the latest observation
     for _, row in obs.iterrows():
         time_str = str(row.iloc[0]).strip()
         if ':51' not in time_str:
             continue
         try:
-            # Parse observation time (EST shown on page) → naive UTC
+            # Parse observation time 
             obs_est = datetime.strptime(f'{today_est} {time_str}', '%Y-%m-%d %I:%M %p')
             obs_utc = obs_est + timedelta(hours=5)
 
-            # Wind column is "NE 3" or "VRB 5" etc — extract numeric speed
+            # Wind column 
             wind_match = re.search(r'(\d+)', str(row.iloc[1]))
             sknt = float(wind_match.group(1)) if wind_match else 0.0
 
@@ -131,12 +97,12 @@ def _scrape_latest_ob():
     return None
 
 
-# ── IEM data fetcher ────────────────────────────────────────────────────────
+# ── IEM data fetcher 
 def fetch_knyc_recent(hours_back: int = 30) -> pd.DataFrame:
     """Fetch the last `hours_back` hours of KNYC :51 ASOS obs from IEM."""
     now   = datetime.now(timezone.utc)
     start = now - timedelta(hours=hours_back)
-    end   = now + timedelta(hours=1)  # +1h so IEM includes the current hour's :51 obs
+    end   = now + timedelta(hours=1) 
 
     url = (
         'https://mesonet.agron.iastate.edu/cgi-bin/request/asos.py'
@@ -156,7 +122,7 @@ def fetch_knyc_recent(hours_back: int = 30) -> pd.DataFrame:
     df.columns = df.columns.str.strip()
     df['valid'] = pd.to_datetime(df['valid']).dt.tz_localize(None)
 
-    # Keep only scheduled :51 ASOS obs (KNYC's cadence)
+    # Keep only scheduled :51 ASOS obs 
     df = df[df['valid'].dt.minute == 51].copy()
 
     for col in ['tmpf', 'dwpf', 'feel', 'mslp', 'sknt', 'relh']:
@@ -186,7 +152,7 @@ def fetch_knyc_recent(hours_back: int = 30) -> pd.DataFrame:
         raw = m.group(1)
         sign = -1 if raw[0] == '1' else 1
         temp_c = sign * int(raw[1:]) / 10.0
-        return temp_c * 9 / 5 + 32  # convert to °F
+        return temp_c * 9 / 5 + 32  
 
     df['mxtmpf_6hr'] = df['metar'].apply(_parse_6hr_max) if 'metar' in df.columns else np.nan
 
@@ -203,7 +169,7 @@ def fetch_knyc_recent(hours_back: int = 30) -> pd.DataFrame:
     return df.sort_values('valid').reset_index(drop=True)
 
 
-# ── Feature engineering ─────────────────────────────────────────────────────
+# ── Feature engineering 
 def engineer_features(raw: pd.DataFrame) -> pd.DataFrame:
     """Apply the same feature pipeline used during training."""
     df = raw.copy()
@@ -212,7 +178,7 @@ def engineer_features(raw: pd.DataFrame) -> pd.DataFrame:
     df['dew_depression'] = df['tmpf'] - df['dwpf']
     df['td_ratio']       = df['dwpf'] / (df['tmpf'] + 0.001)
 
-    # Convert UTC valid to EST for time features (matches retrained model)
+    # Convert UTC valid to EST for time features 
     valid_est = df['valid'] - timedelta(hours=5)
     df['hour']      = valid_est.dt.hour
     df['month']     = valid_est.dt.month
@@ -243,7 +209,7 @@ def engineer_features(raw: pd.DataFrame) -> pd.DataFrame:
     return df
 
 
-# ── Prediction logic ────────────────────────────────────────────────────────
+# ── Prediction logic 
 def get_nowcast() -> dict:
     """Fetch latest obs and return a dict of all prediction values."""
     raw   = fetch_knyc_recent(hours_back=30)
@@ -295,7 +261,7 @@ def get_nowcast() -> dict:
     }
 
 
-# ── Discord embed builder ───────────────────────────────────────────────────
+# ── Discord embed builder 
 def _temp_color(temp_f: float) -> int:
     if temp_f < 32:   return 0x4169E1  # royal blue
     if temp_f < 50:   return 0x00BFFF  # sky blue
@@ -335,10 +301,9 @@ def build_embed(data: dict) -> discord.Embed:
     return embed
 
 
-# ── Discord bot ─────────────────────────────────────────────────────────────
+# ── Discord bot 
 intents = discord.Intents.default()
 bot     = discord.Client(intents=intents)
-
 
 async def post_nowcast_to_channel() -> None:
     """Find the Predictions channel and post the current nowcast embed."""
