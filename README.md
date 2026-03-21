@@ -73,11 +73,10 @@ The bot posts an immediate nowcast on startup to confirm it's working, then alig
 
 Each hour the bot:
 1. Fetches the last 30 hours of KNYC `:51` ASOS observations from the Iowa Mesonet API
-2. Scrapes the IEM observation history page as a fallback for the latest reading (updates faster than the API)
-3. Engineers the same feature set used during training
-4. Runs inference on all three models
-5. Computes a **reassessed high** — the floor-locked max of the model prediction and the observed high so far today
-6. Posts a color-coded Discord embed with current conditions and all three forecasts
+2. Engineers the same feature set used during training
+3. Runs inference on all three models
+4. Computes a **reassessed high** — the floor-locked max of the model prediction and the observed high so far today
+5. Posts a color-coded Discord embed with current conditions and all three forecasts
 
 ---
 
