@@ -6,15 +6,16 @@ import numpy as np
 import pandas as pd
 import joblib
 from datetime import datetime, timezone, timedelta
-
-EST = timezone(timedelta(hours=-5))
+from zoneinfo import ZoneInfo
 from io import StringIO
+
+NY_TZ = ZoneInfo('America/New_York')
 
 from dotenv import load_dotenv
 import discord
 from discord.ext import tasks
 
-# ── Credentials 
+# Credentials 
 load_dotenv()
 DISCORD_TOKEN = os.getenv('DISCORD_TOKEN')
 GUILD_ID = int(os.getenv("GUILD_ID") or 0)
@@ -25,7 +26,7 @@ if not DISCORD_TOKEN:
 if not GUILD_ID:
     raise RuntimeError('GUILD_ID not set. Add it to your .env file.')
 
-# ── Model paths 
+# Model paths 
 _HERE = os.path.dirname(os.path.abspath(__file__))
 
 print('Loading models...')
@@ -34,7 +35,7 @@ model_t3h  = joblib.load(os.path.join(_HERE, 'knyc_model_t3h.pkl'))
 model_t6h  = joblib.load(os.path.join(_HERE, 'knyc_model_t6h.pkl'))
 print('✅ Models loaded')
 
-# ── Feature column list 
+# Feature column list (must match KNYC_Nowcaster.ipynb exactly very crucial!!)  
 FEATURE_COLS = [
     'tmpf', 'dwpf', 'relh', 'mslp', 'sknt', 'feel_gap',
     'dew_depression', 'td_ratio',
@@ -50,59 +51,12 @@ FEATURE_COLS = [
     'hour', 'month', 'dayofyear',
 ]
 
-# ── IEM website scraper 
-def _scrape_latest_ob():
-    """Scrape the latest :51 KNYC obs from IEM obhistory page."""
-    today_est = datetime.now(EST).strftime('%Y-%m-%d')
-    url = (
-        'https://mesonet.agron.iastate.edu/sites/obhistory.php'
-        f'?date={today_est}&sortdir=desc&windunits=kt'
-        '&station=NYC&network=NY_ASOS&metar=0&madis=0'
-    )
-    try:
-        resp = requests.get(url, timeout=15, headers={'Cache-Control': 'no-cache'})
-        resp.raise_for_status()
-        tables = pd.read_html(StringIO(resp.text))
-    except Exception:
-        return None
-
-    obs = max(tables, key=len)
-    if isinstance(obs.columns, pd.MultiIndex):
-        obs.columns = [' '.join(str(c) for c in col).strip() for col in obs.columns]
-
-    for _, row in obs.iterrows():
-        time_str = str(row.iloc[0]).strip()
-        if ':51' not in time_str:
-            continue
-        try:
-            # Parse observation time 
-            obs_est = datetime.strptime(f'{today_est} {time_str}', '%Y-%m-%d %I:%M %p')
-            obs_utc = obs_est + timedelta(hours=5)
-
-            # Wind column 
-            wind_match = re.search(r'(\d+)', str(row.iloc[1]))
-            sknt = float(wind_match.group(1)) if wind_match else 0.0
-
-            return {
-                'valid': obs_utc,
-                'tmpf':  float(row.iloc[5]),
-                'dwpf':  float(row.iloc[6]),
-                'feel':  float(row.iloc[7]),
-                'relh':  float(str(row.iloc[8]).replace('%', '')),
-                'mslp':  float(row.iloc[10]),
-                'sknt':  sknt,
-            }
-        except (ValueError, IndexError, TypeError):
-            continue
-    return None
-
-
-# ── IEM data fetcher 
+# IEM data fetcher 
 def fetch_knyc_recent(hours_back: int = 30) -> pd.DataFrame:
     """Fetch the last `hours_back` hours of KNYC :51 ASOS obs from IEM."""
     now   = datetime.now(timezone.utc)
     start = now - timedelta(hours=hours_back)
-    end   = now + timedelta(hours=1) 
+    end   = now + timedelta(hours=1)  # +1h so IEM includes the current hour's :51 obs
 
     url = (
         'https://mesonet.agron.iastate.edu/cgi-bin/request/asos.py'
@@ -122,7 +76,7 @@ def fetch_knyc_recent(hours_back: int = 30) -> pd.DataFrame:
     df.columns = df.columns.str.strip()
     df['valid'] = pd.to_datetime(df['valid']).dt.tz_localize(None)
 
-    # Keep only scheduled :51 ASOS obs 
+    # Keep only scheduled :51 ASOS obs (KNYC's cadence)
     df = df[df['valid'].dt.minute == 51].copy()
 
     for col in ['tmpf', 'dwpf', 'feel', 'mslp', 'sknt', 'relh']:
@@ -152,24 +106,14 @@ def fetch_knyc_recent(hours_back: int = 30) -> pd.DataFrame:
         raw = m.group(1)
         sign = -1 if raw[0] == '1' else 1
         temp_c = sign * int(raw[1:]) / 10.0
-        return temp_c * 9 / 5 + 32  
+        return temp_c * 9 / 5 + 32  # convert to °F
 
     df['mxtmpf_6hr'] = df['metar'].apply(_parse_6hr_max) if 'metar' in df.columns else np.nan
-
-    # Scrape latest obs from IEM website (updates faster than API)
-    scraped = _scrape_latest_ob()
-    if scraped is not None:
-        latest_valid = df['valid'].max() if not df.empty else None
-        if latest_valid is None or scraped['valid'] > latest_valid:
-            scraped_row = {col: np.nan for col in df.columns}
-            scraped_row.update(scraped)
-            df = pd.concat([df, pd.DataFrame([scraped_row])], ignore_index=True)
-            print(f'[DEBUG] Appended scraped obs: {scraped["valid"]}')
 
     return df.sort_values('valid').reset_index(drop=True)
 
 
-# ── Feature engineering 
+# Feature engineering
 def engineer_features(raw: pd.DataFrame) -> pd.DataFrame:
     """Apply the same feature pipeline used during training."""
     df = raw.copy()
@@ -178,8 +122,9 @@ def engineer_features(raw: pd.DataFrame) -> pd.DataFrame:
     df['dew_depression'] = df['tmpf'] - df['dwpf']
     df['td_ratio']       = df['dwpf'] / (df['tmpf'] + 0.001)
 
-    # Convert UTC valid to EST for time features 
-    valid_est = df['valid'] - timedelta(hours=5)
+    # Convert UTC valid to NY local time for time features (matches retrained model)
+    utc_offset = datetime.now(NY_TZ).utcoffset()
+    valid_est = df['valid'] + utc_offset
     df['hour']      = valid_est.dt.hour
     df['month']     = valid_est.dt.month
     df['dayofyear'] = valid_est.dt.dayofyear
@@ -209,7 +154,7 @@ def engineer_features(raw: pd.DataFrame) -> pd.DataFrame:
     return df
 
 
-# ── Prediction logic 
+# Prediction logic
 def get_nowcast() -> dict:
     """Fetch latest obs and return a dict of all prediction values."""
     raw   = fetch_knyc_recent(hours_back=30)
@@ -230,16 +175,15 @@ def get_nowcast() -> dict:
     pred_t3h  = float(model_t3h.predict(latest[FEATURE_COLS])[0])
     pred_t6h  = float(model_t6h.predict(latest[FEATURE_COLS])[0])
 
-    # Use EST calendar day for obs high tracking
-    today_est = datetime.now(EST).date()
-    valid_est = raw['valid'] - timedelta(hours=5)
+    # Use NY_TZ calendar day for obs high tracking
+    today_est = datetime.now(NY_TZ).date()
+    utc_offset = datetime.now(NY_TZ).utcoffset()
+    valid_est = raw['valid'] + utc_offset
     today_mask = valid_est.dt.date == today_est
 
-    # Hourly :51 temps for today (EST)
     today_tmpf = raw.loc[today_mask, 'tmpf'].dropna()
     max_tmpf = float(today_tmpf.max()) if not today_tmpf.empty else None
 
-    # 6-hour max temps from METAR remarks for today (EST)
     today_mxt = raw.loc[today_mask, 'mxtmpf_6hr'].dropna() if 'mxtmpf_6hr' in raw.columns else pd.Series(dtype=float)
     max_mxt = float(today_mxt.max()) if not today_mxt.empty else None
 
@@ -261,7 +205,7 @@ def get_nowcast() -> dict:
     }
 
 
-# ── Discord embed builder 
+# Discord embed builder 
 def _temp_color(temp_f: float) -> int:
     if temp_f < 32:   return 0x4169E1  # royal blue
     if temp_f < 50:   return 0x00BFFF  # sky blue
@@ -272,7 +216,7 @@ def _temp_color(temp_f: float) -> int:
 
 def build_embed(data: dict) -> discord.Embed:
     color   = _temp_color(data['reassessed'])
-    obs_ts  = data['valid_t'].replace(tzinfo=timezone.utc).astimezone(EST).strftime('%H:%M EST')
+    obs_ts  = data['valid_t'].replace(tzinfo=timezone.utc).astimezone(NY_TZ).strftime('%H:%M %Z')
     obs_str = f"{data['obs_high']:.1f}°F" if data['obs_high'] is not None else '—'
     obs_note = '\n*(obs exceeded model)*' if (
         data['obs_high'] is not None and data['obs_high'] > data['pred_high']
@@ -301,9 +245,10 @@ def build_embed(data: dict) -> discord.Embed:
     return embed
 
 
-# ── Discord bot 
+# Discord 
 intents = discord.Intents.default()
 bot     = discord.Client(intents=intents)
+
 
 async def post_nowcast_to_channel() -> None:
     """Find the Predictions channel and post the current nowcast embed."""
@@ -321,10 +266,10 @@ async def post_nowcast_to_channel() -> None:
         data  = get_nowcast()
         embed = build_embed(data)
         await channel.send(embed=embed)
-        ts = datetime.now(EST).strftime('%H:%M EST')
+        ts = datetime.now(NY_TZ).strftime('%H:%M %Z')
         print(f'[{ts}] Posted nowcast  →  reassessed high {data["reassessed"]:.1f}°F')
     except Exception as exc:
-        ts = datetime.now(EST).strftime('%H:%M EST')
+        ts = datetime.now(NY_TZ).strftime('%H:%M %Z')
         print(f'[{ts}] Error: {exc}')
         await channel.send(f'⚠️ Nowcaster error: `{exc}`')
 
@@ -345,14 +290,14 @@ async def nowcast_loop() -> None:
 
 @nowcast_loop.before_loop
 async def before_nowcast_loop() -> None:
-    """Align to :59 UTC so we run 8 min after each KNYC :51 METAR."""
+    """Align to :02 UTC so we run right after the API updates at :01."""
     await bot.wait_until_ready()
     now      = datetime.now(timezone.utc)
-    next_run = now.replace(minute=59, second=0, microsecond=0)
+    next_run = now.replace(minute=2, second=0, microsecond=0)
     if next_run <= now:
         next_run += timedelta(hours=1)
     wait = (next_run - now).total_seconds()
-    print(f'Hourly loop aligned — first tick at {next_run.astimezone(EST).strftime("%H:%M EST")} ({wait / 60:.0f} min)')
+    print(f'Hourly loop aligned — first tick at {next_run.astimezone(NY_TZ).strftime("%H:%M %Z")} ({wait / 60:.0f} min)')
     await asyncio.sleep(wait)
 
 
